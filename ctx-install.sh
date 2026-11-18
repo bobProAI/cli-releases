@@ -1,11 +1,12 @@
 #!/bin/sh
-# Installs ctx on a Mac with Apple silicon. Paste this into a terminal:
+# Installs ctx on a Mac with Apple silicon or on Linux x64. Paste this into a
+# terminal:
 #
 #   curl -fsSL https://raw.githubusercontent.com/bobProAI/cli-releases/main/ctx-install.sh | sh
 #
 # It reads the newest version from ctx-latest.txt, downloads that release of
-# ctx from bobProAI/cli-releases, checks its sha256, and installs it as
-# $HOME/.local/bin/ctx. Optional variables:
+# ctx for this machine from bobProAI/cli-releases, checks its sha256, and
+# installs it as $HOME/.local/bin/ctx. Optional variables:
 #
 #   CTX_VERSION       installs this version, such as 0.1.0, instead of the newest
 #   CTX_RAW_BASE      replaces https://raw.githubusercontent.com/bobProAI/cli-releases/main
@@ -32,16 +33,38 @@ cleanup() {
   fi
 }
 
+# Sets asset to the release binary for this machine. Two platforms have one.
+# Every other machine stops here, before any download.
 check_platform() {
   os=$(uname -s)
   arch=$(uname -m)
   if [ "$os" = Darwin ] && [ "$arch" = arm64 ]; then
+    asset=ctx-darwin-arm64
     return
   fi
-  if [ "$os" = Darwin ] && [ "$arch" = x86_64 ]; then
-    fail "ctx needs macOS on Apple silicon (arm64), and this terminal reports an Intel Mac (x86_64). If this Mac has Apple silicon, the terminal runs under Rosetta. Open a terminal without Rosetta and run the install command again."
+  if [ "$os" = Linux ] && [ "$arch" = x86_64 ]; then
+    asset=ctx-linux-x64
+    return
   fi
-  fail "ctx needs macOS on Apple silicon (Darwin arm64), and this machine reports $os $arch. Run the install command on a Mac with Apple silicon."
+  supported="ctx runs on macOS on Apple silicon (Darwin arm64) and on Linux x64 (Linux x86_64)"
+  if [ "$os" = Darwin ] && [ "$arch" = x86_64 ]; then
+    fail "$supported, and this terminal reports an Intel Mac (Darwin x86_64). If this Mac has Apple silicon, the terminal runs under Rosetta. Open a terminal without Rosetta and run the install command again."
+  fi
+  fail "$supported, and this machine reports $os $arch. Run the install command on one of those two platforms."
+}
+
+# Sets sha256_tool to the tool that checks the download. macOS ships shasum.
+# Linux has sha256sum from coreutils, and some images have only shasum.
+check_sha256_tool() {
+  if [ "$os" = Linux ] && command -v sha256sum >/dev/null 2>&1; then
+    sha256_tool=sha256sum
+  elif command -v shasum >/dev/null 2>&1; then
+    sha256_tool=shasum
+  elif [ "$os" = Linux ]; then
+    fail "found neither sha256sum nor shasum, so the download cannot be checked. Install coreutils, which holds sha256sum, and run the install command again."
+  else
+    fail "found no shasum, so the download cannot be checked. macOS ships it in /usr/bin. Put /usr/bin on the PATH and run the install command again."
+  fi
 }
 
 read_version() {
@@ -72,18 +95,22 @@ install_binary() {
   # The download sits next to the target, so the mv below is a rename. A run
   # that stops before it leaves any earlier ctx in place and working.
   download="$bin_dir/.ctx-download-$$"
-  say "downloading ctx $version from $release_url"
-  curl -fsSL -o "$download" "$release_url/ctx-darwin-arm64" ||
-    fail "could not download $release_url/ctx-darwin-arm64. Check the internet connection and that release ctx-v$version exists at https://github.com/bobProAI/cli-releases/releases, then run the install command again."
+  say "downloading ctx $version ($asset) from $release_url"
+  curl -fsSL -o "$download" "$release_url/$asset" ||
+    fail "could not download $release_url/$asset. Check the internet connection and that the release ctx-v$version at https://github.com/bobProAI/cli-releases/releases has the file $asset, then run the install command again."
   sums=$(curl -fsSL "$release_url/SHA256SUMS") ||
     fail "could not download $release_url/SHA256SUMS. Check the internet connection and run the install command again."
-  expected=$(printf '%s\n' "$sums" | awk '$2 == "ctx-darwin-arm64" { print $1; exit }')
+  expected=$(printf '%s\n' "$sums" | awk -v name="$asset" '$2 == name { print $1; exit }')
   if [ -z "$expected" ]; then
-    fail "SHA256SUMS of ctx $version has no line for ctx-darwin-arm64, so nothing was installed. Tell the ctx maintainers."
+    fail "SHA256SUMS of ctx $version has no line for $asset, so nothing was installed. Tell the ctx maintainers."
   fi
-  actual=$(shasum -a 256 "$download" | awk '{ print $1 }')
+  if [ "$sha256_tool" = sha256sum ]; then
+    actual=$(sha256sum "$download" | awk '{ print $1 }')
+  else
+    actual=$(shasum -a 256 "$download" | awk '{ print $1 }')
+  fi
   if [ "$actual" != "$expected" ]; then
-    fail "checksum mismatch: the downloaded ctx-darwin-arm64 does not match its sha256 in SHA256SUMS, so nothing was installed. Any earlier ctx still works. Run the install command again. If it fails again, tell the ctx maintainers."
+    fail "checksum mismatch: the downloaded $asset does not match its sha256 in SHA256SUMS, so nothing was installed. Any earlier ctx still works. Run the install command again. If it fails again, tell the ctx maintainers."
   fi
   chmod 755 "$download"
   mv -f "$download" "$target"
@@ -94,9 +121,16 @@ update_path() {
   case ":${PATH:-}:" in
     *":$bin_dir:"*) return ;;
   esac
-  profile="$HOME/.zprofile"
-  # $HOME and $PATH stay as text here. zsh expands them when it reads the file.
+  # $HOME and $PATH stay as text here. The shell expands them when it reads
+  # the line.
   line='export PATH="$HOME/.local/bin:$PATH"'
+  # Linux has no one startup file that every shell reads, and a CI job reads
+  # none. So on Linux the script changes no file and says what to add.
+  if [ "$os" = Linux ]; then
+    say "$bin_dir is not on the PATH. Run ctx as $target, or add this line to the startup file of your shell, such as $HOME/.bashrc, and open a new terminal: $line"
+    return
+  fi
+  profile="$HOME/.zprofile"
   if [ -f "$profile" ] && grep -qxF "$line" "$profile"; then
     say "$profile already puts $bin_dir on the PATH. Open a new terminal to use ctx."
     return
@@ -113,13 +147,18 @@ update_path() {
 }
 
 print_version() {
-  installed=$("$target" --version) ||
+  if ! installed=$("$target" --version); then
+    if [ "$os" = Linux ]; then
+      fail "$target is in place but did not run. ctx for Linux needs glibc, so it does not run on Alpine or another system with musl. On any other system, send the output above to the ctx maintainers."
+    fi
     fail "$target is in place but did not run. Send the output above to the ctx maintainers."
+  fi
   say "installed ctx $installed at $target"
 }
 
 main() {
   check_platform
+  check_sha256_tool
   if [ -z "${HOME:-}" ]; then
     fail "HOME is not set. Open a new terminal and run the install command again."
   fi
